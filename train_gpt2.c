@@ -83,6 +83,8 @@ void layernorm_forward(float* out, float* mean, float* rstd,
     // mean and rstd are (B,T) buffers, to be used later in backward pass
     // at each position (b,t) of the input, the C-dimensional vector
     // of activations gets normalized, then scaled and shifted
+
+    // 对给定第b个样本的第t个token的C维输入向量进行LayerNorm
     float eps = 1e-5f;
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
@@ -160,6 +162,15 @@ void layernorm_backward(float* dinp, float* dweight, float* dbias,
     }
 }
 
+/*
+inp is (B,T,C)
+out is (B,T,OC)
+
+weight is (OC, C)
+bias is (OC)
+
+out = inp @ weight^T + bias
+*/
 void matmul_forward_naive(float* out,
                          const float* inp, const float* weight, const float* bias,
                          int B, int T, int C, int OC) {
@@ -173,7 +184,14 @@ void matmul_forward_naive(float* out,
             for (int o = 0; o < OC; o++) {
                 float val = (bias != NULL) ? bias[o] : 0.0f;
                 for (int i = 0; i < C; i++) {
-                    val += inp[bt * C + i] * weight[o*C + i];
+                    // 注意这里是weight大小是[OC, C]
+                    // 因此计算公式是 inp[bt * C + i] * weight[o * C + i]
+                    // 而不是         inp[bt * C + i] * weight[i * OC + o]
+
+                    // 即inp中某个embedding的第i维 与 weight中第o行的第i维相乘
+                    // 等价于把inp看成若干个1行C列的矩阵 每个矩阵与weight中的某一行(也是1行C列矩阵) 做点积
+                    // 本质上等价于显示转置 out = inp @ weight^T + bias
+                    val += inp[bt * C + i] * weight[o * C + i];
                 }
                 out[bt * OC + o] = val;
             }
@@ -272,9 +290,17 @@ void attention_forward(float* out, float* preatt, float* att,
                        float* inp,
                        int B, int T, int C, int NH) {
     // input is (B, T, 3C) holding the query, key, value (Q, K, V) vectors
+    // 依次按照Q,K,V的顺序存储在最后一个维度上
+
     // preatt, att are (B, NH, T, T). NH = number of heads, T = sequence length
     // that holds the pre-attention and post-attention scores (used in backward)
+    // 其中
+    // preatt_bth = Q @ K^T = (B, NH, T, hs) @ (B, NH, hs, T) = (B, NH, T, T)
+    // att_bth = softmax(preatt_bth) = (B, NH, T, T)
+
     // output is (B, T, C)
+    // out = att_bth @ V = (B, NH, T, T) @ (B, NH, T, hs) = (B, NH, T, hs) = (B, T, C)
+
     // attention is the only layer that mixes information across time
     // every other operation is applied at every (b,t) position independently
     // (and of course, no layer mixes information across batch)
@@ -286,13 +312,29 @@ void attention_forward(float* out, float* preatt, float* att,
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
             for (int h = 0; h < NH; h++) {
-                float* query_t = inp + b * T * C3 + t * C3 + h * hs;
-                float* preatt_bth = preatt + b*NH*T*T + h*T*T + t*T;
-                float* att_bth = att + b*NH*T*T + h*T*T + t*T;
+                // 现在要计算第b个样本的第t个token的第h个head的注意力
+                // query_t是对应的Q向量 大小是head_size
+                float *query_t = inp + b * T * C3 + t * C3 + h * hs;
+
+                // [B, H, T, T]
+                float *preatt_bth = preatt + b * NH * T * T + h * T * T + t * T;
+                float *att_bth = att + b * NH * T * T + h * T * T + t * T;
 
                 // pass 1: calculate query dot key and maxval
+                // maxval用来记录Q @ K^T的最大值 后面计算softmax时 把所有值都减去maxval
+                /*
+                Q @ K^T
+                = [B, T, C] @ [B, C, T]
+                = [B, NH, T, hs] @ [B, NH, hs, T]
+
+                给定 第b个样本的 第t个token的 第h个head
+                计算 query_t 和 key_t2 的点积 得到两个token之间的注意力分数(一个标量)
+                */
                 float maxval = -10000.0f; // TODO something better
+                // casual masked attention: only attend to positions <= t
                 for (int t2 = 0; t2 <= t; t2++) {
+                    // key_t2是第b个样本的第t2个token的第h个head的K向量 大小是head_size
+                    // 其中t2 <= t
                     float* key_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C; // +C because it's key
 
                     // (query_t) dot (key_t2)
@@ -330,11 +372,22 @@ void attention_forward(float* out, float* preatt, float* att,
                 }
 
                 // pass 4: accumulate weighted values into the output of attention
+                // out大小是[B, T, C] = [B, T, NH, hs]
+                // out_bth是第b个样本的第t个token的第h个head在输出中的位置
                 float* out_bth = out + b * T * C + t * C + h * hs;
+
                 for (int i = 0; i < hs; i++) { out_bth[i] = 0.0f; }
+
+                // out[b,h,t,i] += att_bth[b,h,t,t2] * V[b,h,t2,i]
+                // out_bth就是根据注意力分数att_bth对V加权求和的结果
+                // out_bth大小是head_size
                 for (int t2 = 0; t2 <= t; t2++) {
+                    // value_t2是第b个样本的第t2个token的第h个head的V向量 大小是head_size
+                    // 其中t2 <= t
                     float* value_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C*2; // +C*2 because it's value
+                    // att_btht2是第b个样本的第t个token的第h个head 对 第t2个token的注意力分数
                     float att_btht2 = att_bth[t2];
+
                     for (int i = 0; i < hs; i++) {
                         out_bth[i] += att_btht2 * value_t2[i];
                     }
@@ -762,6 +815,8 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     model->mean_loss = -1.0f; // -1.0f will designate no loss
 }
 
+// inputs和targets大小都是(B,T)的整数矩阵
+// 每个元素token的索引，范围是[0, V)，其中V是词表大小
 void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
     // targets are optional and could be NULL
 
@@ -822,9 +877,13 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
     ParameterTensors params = model->params; // for brevity
     ActivationTensors acts = model->acts;
     float* residual;
+    // 将inputs的token embedding和position embedding相加得到acts.encoded 作为输入 大小是[B,T,C]
     encoder_forward(acts.encoded, inputs, params.wte, params.wpe, B, T, C); // encoding goes into residual[0]
+
     for (int l = 0; l < L; l++) {
 
+        // 如果是第一层 输入来自于embedding
+        // 如果不是第一层 输入来自于前一层的residual3
         residual = l == 0 ? acts.encoded : acts.residual3 + (l-1) * B * T * C;
 
         // get the pointers of the weights for this layer
@@ -859,20 +918,34 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
         float* l_fcproj = acts.fcproj + l * B * T * C;
         float* l_residual3 = acts.residual3 + l * B * T * C;
 
+        // ----- Attention sublayer -----
         // now do the forward pass
         layernorm_forward(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C);
+        // 生成QKV 大小是[B, T, 3*C]
         matmul_forward(l_qkv, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C);
+        // Attention计算: 分别计算各个head的attention 最后合并多头输出
+        // 输出l_atty大小为[B, T, C]
         attention_forward(l_atty, l_preatt, l_att, l_qkv, B, T, C, NH);
+        // 重新线性组合各个头的信息 l_attprojw大小是[C, C] l_attprojb大小是[C]
         matmul_forward(l_attproj, l_atty, l_attprojw, l_attprojb, B, T, C, C);
+        // Attention子层的输出l_residual2 = 输入residual + l_attproj
         residual_forward(l_residual2, residual, l_attproj, B*T*C);
+
+        // ----- MLP sublayer -----
         layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, C);
+        // [B, T, C] -> [B, T, 4*C]
         matmul_forward(l_fch, l_ln2, l_fcw, l_fcb, B, T, C, 4*C);
         gelu_forward(l_fch_gelu, l_fch, B*T*4*C);
+        // [B, T, 4*C] -> [B, T, C]
         matmul_forward(l_fcproj, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4*C, C);
+        // MLP子层的输出l_residual3 = 输入residual2 + l_fcproj
         residual_forward(l_residual3, l_residual2, l_fcproj, B*T*C);
     }
+
+    // residual = 最后一个Decoder Block的输出
     residual = acts.residual3 + (L-1) * B * T * C; // last residual is in residual3
     layernorm_forward(acts.lnf, acts.lnf_mean, acts.lnf_rstd, residual, params.lnfw, params.lnfb, B, T, C);
+    // [B, T, C] -> [B, T, vocab_size]
     matmul_forward(acts.logits, acts.lnf, params.wte, NULL, B, T, C, Vp);
     softmax_forward(acts.probs, acts.logits, B, T, V, Vp);
 
@@ -1162,7 +1235,11 @@ int main() {
         // do a training step
         clock_gettime(CLOCK_MONOTONIC, &start);
         dataloader_next_batch(&train_loader);
+
+        // train_loader.inputs大小是[B, T]
+        // train_loader.targets大小是[B, T]
         gpt2_forward(&model, train_loader.inputs, train_loader.targets, B, T);
+
         gpt2_zero_grad(&model);
         gpt2_backward(&model);
         gpt2_update(&model, 1e-4f, 0.9f, 0.999f, 1e-8f, 0.0f, step+1);
